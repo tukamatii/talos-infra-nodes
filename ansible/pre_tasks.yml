@@ -1,0 +1,161 @@
+---
+- name: Apply NoSchedule taint to infra nodes
+  ansible.builtin.shell:
+    cmd: >
+      kubectl --kubeconfig "{{ kube_config_file }}"
+      taint node "{{ item }}"
+      node-role.kubernetes.io/infra=:NoSchedule
+      --overwrite
+    executable: /bin/bash
+  loop: "{{ groups[target]
+    | map('extract', hostvars)
+    | selectattr('talos_node_type', '==', 'infra')
+    | map(attribute='inventory_hostname')
+    | list }}"
+  loop_control:
+    label: "node={{ item }}"
+  delegate_to: localhost
+  changed_when: false
+
+- name: Label infra nodes with node-role.kubernetes.io/infra
+  ansible.builtin.shell:
+    cmd: >
+      kubectl --kubeconfig "{{ kube_config_file }}"
+      label node "{{ item }}"
+      node-role.kubernetes.io/infra=""
+      --overwrite
+    executable: /bin/bash
+  loop: "{{ groups[target]
+    | map('extract', hostvars)
+    | selectattr('talos_node_type', '==', 'infra')
+    | map(attribute='inventory_hostname')
+    | list }}"
+  loop_control:
+    label: "node={{ item }}"
+  delegate_to: localhost
+  changed_when: false
+
+- name: Label worker nodes with node-role.kubernetes.io/worker
+  ansible.builtin.shell:
+    cmd: >
+      kubectl --kubeconfig "{{ kube_config_file }}"
+      label node "{{ item }}"
+      node-role.kubernetes.io/worker=""
+      --overwrite
+    executable: /bin/bash
+  loop: "{{ groups[target]
+    | map('extract', hostvars)
+    | selectattr('talos_node_type', '==', 'worker')
+    | map(attribute='inventory_hostname')
+    | list }}"
+  loop_control:
+    label: "node={{ item }}"
+  delegate_to: localhost
+  changed_when: false
+
+- name: Define infra-targeted Kubernetes components
+  ansible.builtin.set_fact:
+    infra_components:
+      - kind: DaemonSet
+        name: vsphere-cloud-controller-manager
+        namespace: kube-system
+      - kind: Deployment
+        name: cilium-operator
+        namespace: kube-system
+      - kind: Deployment
+        name: coredns
+        namespace: kube-system
+      - kind: Deployment
+        name: hubble-relay
+        namespace: kube-system
+      - kind: Deployment
+        name: hubble-ui
+        namespace: kube-system
+      - kind: Deployment
+        name: vsphere-csi-controller
+        namespace: vmware-csi
+
+- name: Fetch current state of infra components
+  kubernetes.core.k8s_info:
+    api_version: "{{ 'apps/v1' if item.kind in ['Deployment', 'DaemonSet'] else 'v1' }}"
+    kind: "{{ item.kind }}"
+    name: "{{ item.name }}"
+    namespace: "{{ item.namespace }}"
+    kubeconfig: "{{ kube_config_file }}"
+  loop: "{{ infra_components }}"
+  loop_control:
+    label: "{{ item.kind }}/{{ item.namespace }}/{{ item.name }}"
+  register: current_components
+  delegate_to: localhost
+
+- name: Patch infra components with tolerations, affinity, and trigger rollout
+  kubernetes.core.k8s:
+    state: patched
+    api_version: apps/v1
+    kind: "{{ item.item.kind }}"
+    name: "{{ item.item.name }}"
+    namespace: "{{ item.item.namespace }}"
+    kubeconfig: "{{ kube_config_file }}"
+    definition:
+      spec:
+        template:
+          spec:
+            tolerations:
+              - key: "node-role.kubernetes.io/infra"
+                operator: "Equal"
+                value: ""
+                effect: "NoSchedule"
+            affinity:
+              nodeAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                    - matchExpressions:
+                        - key: node-role.kubernetes.io/infra
+                          operator: In
+                          values: [""]
+          metadata:
+            annotations:
+              okbtsp.corp/infra-restarted: "true"
+              kubectl.kubernetes.io/restartedAt: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+  loop: "{{ current_components.results }}"
+  loop_control:
+    label: "{{ item.item.kind }}/{{ item.item.namespace }}/{{ item.item.name }}"
+  when:
+    - item.resources | length > 0
+    - (item.resources[0].spec.template.metadata.annotations is not defined) or
+      (item.resources[0].spec.template.metadata.annotations.get("okbtsp.corp/infra-restarted") != "true")
+  delegate_to: localhost
+
+- name: Wait for infra-targeted components to complete rollout
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: "{{ item.kind }}"
+    name: "{{ item.name }}"
+    namespace: "{{ item.namespace }}"
+    kubeconfig: "{{ kube_config_file }}"
+  register: rollout_status
+  until: >
+    rollout_status.resources | length > 0 and
+    rollout_status.resources[0].status is defined and
+    (
+      (item.kind == 'Deployment' and
+        rollout_status.resources[0].status.updatedReplicas is defined and
+        rollout_status.resources[0].status.replicas is defined and
+        rollout_status.resources[0].status.availableReplicas is defined and
+        rollout_status.resources[0].status.updatedReplicas == rollout_status.resources[0].status.replicas and
+        rollout_status.resources[0].status.availableReplicas == rollout_status.resources[0].status.replicas
+      ) or
+      (item.kind == 'DaemonSet' and
+        rollout_status.resources[0].status.desiredNumberScheduled is defined and
+        rollout_status.resources[0].status.numberReady is defined and
+        rollout_status.resources[0].status.updatedNumberScheduled is defined and
+        rollout_status.resources[0].status.numberReady == rollout_status.resources[0].status.desiredNumberScheduled and
+        rollout_status.resources[0].status.updatedNumberScheduled == rollout_status.resources[0].status.desiredNumberScheduled
+      )
+    )
+  retries: 60
+  delay: 10
+  loop: "{{ infra_components }}"
+  loop_control:
+    label: "{{ item.kind }}/{{ item.namespace }}/{{ item.name }}"
+  delegate_to: localhost
